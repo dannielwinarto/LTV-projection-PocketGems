@@ -1,0 +1,359 @@
+---
+title: "PocketGems_DataChallenge"
+author: "Danniel_Winarto"
+date: "August 6, 2017"
+output: html_document
+---
+
+
+##Table of Content :
+###1. Approach
+###2. Setup, 1st stage Data Cleaning
+###3. Missing Value inspection
+###4. Exploratory
+###5. 2nd stage Data Cleaning and Building Model 
+###6. Thoughts about Session table
+###7. Answer to questions
+###8. Crossvalidation of the model
+
+
+
+##1. Approach
+    read the dataset
+    extract the device type from the column hw_ver
+    find of each table the missing values using library(VIM)
+    exploratory analysis:
+    	how many registered user actually ever played the game
+    	how many registered user actually spend money on the game
+    	comparing the existing user tracked in session table against list of user in user table
+    	aggregated money spent by the user, also the frequency of purchase
+    	etc
+    Data wrangling & modelling:
+    	joining user table & IAP table
+    	for each purchase, find how many days and weeks since registration day(day1)
+    	aggregate revenue by day (total revenue)
+    	plot and see total revenue by day since regristration day
+    	find the cumulative sum of the revenue by day
+    	and then divide cumulative sum by the total registered user (question asked about average LTV)
+    	plot and observe
+    	try to fit average cumulative plot with into a(log(days))+ b(days^2) + c(day) + intercept
+    	refit the model and make a projection until the revenue decay
+    
+
+##2. Setup, 1st stage data cleaning
+#### reading the data, date format, and renaming some columns. Also on this stage, I learned that timeframe of each table 
+```{r}
+setwd("C:/Users/dan_9/Desktop/Pocket Gems  Danniel/Marketing Data Analyst HW (Aug, 2017)/Marketing Data Analyst HW (Aug, 2017)")
+
+rm(list = ls())
+dev.off()
+
+library(data.table)
+library(lubridate)
+library(VIM)
+library(stringr)
+library(caret)
+
+IAP = fread("IAP Data.csv") # in app purchase
+session =  fread("Sessions Data.csv")
+user = fread("Users Data.csv")
+# converting  the date into date format
+IAP$date = mdy(IAP$date)
+session$date = mdy(session$date)
+user$install_date = mdy(user$install_date)
+
+# extracting the device type
+user[, device_type := str_split_fixed(hw_ver, ",",2)[,1]]
+user[, hw_ver := NULL] # deleting hw_ver column
+
+date_range = data.table(table.name = c("IAP","session", "user"),
+                        earliest = c(min((IAP$date)), min((session$date)), min((user$install_date))),
+                        latest = c(max((IAP$date)), max((session$date)), max((user$install_date))))
+
+# renaming "date" colum to be more specific
+colnames(IAP)[2] = "transaction_date"
+colnames(session)[2] = "session_date"
+
+# timeframe of each table 
+date_range
+```
+
+
+##3. Missing Value inspection
+#### By inspection, now we know that the country column contains some NA
+```{r}
+IAP.miss.val = aggr(IAP)
+session.miss.val = aggr(session)
+user.miss.val = aggr(user)
+summary(user.miss.val)
+```
+
+
+##4. Exploratory
+```{r}
+# Finding the the frequency of device
+sort(table(user$device_type), decreasing = T)
+length(unique(user$udid)) # 58842 users regiestered 
+length(unique(session$udid)) # 58831 users played the game
+length(setdiff(session$udid,user$udid)) # 6 users are not in exist User table played  the game
+length(setdiff(user$udid,session$udid)) # 17 users are in User table never played the game after installation 
+length(setdiff(IAP$udid, user$udid )) # all user who are listed In App purchase exist in User table
+length(setdiff( user$udid, IAP$udid)) # 56656 users never  purchase 
+length(intersect( user$udid, IAP$udid)) # 2186 users performed in app purchase 
+
+paste(round(2186/58842*100,2), " percent registered users performed in app purchase")
+
+# 6 months aggregation of each paid-user:
+total.IAP.by.paiduser =  IAP[,lapply(.SD, sum), by = udid, .SDcols = c("daily_iap_rev", "purchases_made")][order(-daily_iap_rev)]
+
+# biggest spender within 6 months period:
+total.IAP.by.paiduser[daily_iap_rev == max(total.IAP.by.paiduser$daily_iap_rev)]
+
+# most frequent spender within 6 months period:
+total.IAP.by.paiduser[purchases_made == max(total.IAP.by.paiduser$purchases_made)]
+
+# highest average spender within 6 months period:
+avg.IAP.by.paiduser =  IAP[,lapply(.SD, mean), by = udid , .SDcols = c("daily_iap_rev", "purchases_made") ]
+avg.IAP.by.paiduser[daily_iap_rev == max(avg.IAP.by.paiduser$daily_iap_rev)] 
+IAP[udid == "20a9272c32354572aa9d97cb6df5e021"] 
+# average app purchase per transaction event doesnt really tell anything, because a user may perform a large purchase once in his lifetime and  skewing the distribution
+```
+
+
+
+##5. 2nd stage Data Cleaning and Building Model
+
+In this stage, I joined User table and IAP table, the reason is because I want to substract the purchase date with the registration date, which would give me days since registration date. Which means there are 7 types of day1 ( since the registration date varies from 2015-06-01 to 2015-06-07). Once I have "days since registration date"", I can aggregate the purchase amount by that day and figure out how much money spent on day 1,2,3,4,..., 191 since initial registration date. 
+I ploted the Purchase frequency per week to see if how the frequency of purchase progress along the week
+ I ploted average revenue per day since registration day, and the area under the curve is LTV of 6 months
+ I decided to use the cumulative sum of average revenue perday, because of the ease of fitting cumulative plot with logarithmic function, therefore I calculated the cumulative sum and my LTV model defined as:
+<center><h3>LTV(days) =  intercept + a(log(days)) + b(days)^2 + c(days)</h3></center>
+#### By Using this model, I plotted the projection of my model on top of the actual data. I found out that the LTV of this game will be $6.91 which ends at day 587th since initial registration day (1.9 years)
+
+```{r}
+# data wrangling
+# Inner join IAP table and User table
+user.IAP = merge(user, IAP, by = "udid", all = FALSE)
+user.IAP[,days_since_day1 := as.numeric( transaction_date - install_date + 1)][, week_since_week1:= floor((days_since_day1/7) + 1) ]
+setkeyv(user.IAP, c("udid", "days_since_day1"))
+plot(table(user.IAP$week_since_week1), xlab = "Weeks since the register day", ylab = "Purchase Frequency", main = "Purchase Frequency by week")
+
+# Revenue by day
+aggregated.daily.revenue = user.IAP[,lapply(.SD, sum),by = days_since_day1, .SDcols = "daily_iap_rev"][order(days_since_day1)] 
+plot(y = (aggregated.daily.revenue$daily_iap_rev)/length(unique(user$udid)), 
+     x = aggregated.daily.revenue$days_since_day1,
+     type = "l", 
+     xlab = "days since register day", 
+     ylab = "Revenue per user", 
+     main = "Average Revenue Peruser by \nDay Since Registration Day")
+
+# adding cumulative sum revenue column
+aggregated.daily.revenue[,cumsum_rev_peruser := cumsum(daily_iap_rev)/length(unique(user$udid))]
+
+# plotting the CumSum plot based on given data (6 months timeframe)
+plot(y = aggregated.daily.revenue$cumsum_rev_peruser,
+     x = aggregated.daily.revenue$days_since_day1,
+     type = "p", 
+     xlab = "days since registration day",
+     xlim = c(1,650),
+     ylim = c(0, 8),
+     ylab = "Cumulative sum revenue per user in $",
+     main = "LTV per user by \nDays Since Registration Day (actual 6 months)")
+abline(max( aggregated.daily.revenue$cumsum_rev_peruser),0)
+
+lm_model = lm(cumsum_rev_peruser ~ log(days_since_day1) + poly(days_since_day1,2) , data = aggregated.daily.revenue) 
+summary(lm_model)
+# LTV(days) =  intercept + alog(days) + b(days)^2 + c(days) 
+
+plot(y = aggregated.daily.revenue$cumsum_rev_peruser,
+     x = aggregated.daily.revenue$days_since_day1,
+     pch = 1, 
+     xlab = "days since registration day",
+     xlim = c(1,650),
+     ylim = c(0, 8),
+     ylab = "Cumulative sum revenue per user in $",
+     main = "CumSum Revenue per user by Days Since\n Registration Day (actual 6 months & prediction)")
+abline(max( aggregated.daily.revenue$cumsum_rev_peruser),0, lty = 5)
+
+lines(predict(lm_model, data.frame(days_since_day1 = c(1:650))), col = "blue")
+abline(max(predict(lm_model, data.frame(days_since_day1 = c(1:650)))),0, lty = 5)
+abline(v = which.max (predict(lm_model, data.frame(days_since_day1 = c(1:650)))), lty = 5)
+legend(-14, 8.2, legend=c("actual", "prediction"),
+       col=c("black", "blue"), lty=c(3,1), cex=0.6,
+       title="Legend", text.font=4)
+
+text(245, 3.5, "($3.92, 191)")
+text(520, 7.2, "($6.91, 587)")
+text(120, 4.2, "LTV 6 months (given)")
+text(250, 7.2, "LTV predicted")
+```
+
+##6. Thoughts about Session table
+#### The  main reason why I didn't consider a session table in my approach is due to relatively shorter timerange in this table. As inspection in section 2, it only has information until August 31st (3 months), whereas IAP table up to 6 months. However, I have inspected to see if there are correlation between the frequency of plays and total revenue at a given day. Based on 3 months timeframe, I can see there are quite strong correlation between 
+#### 1. frequency plays and daily Revenue (0.78 correlation coefficient)
+#### 2. frequency plays and frequency purchase (0.92 correlation coefficient)
+#### Potentially, We can probably analyze and come up with formula that generalized the relation between these 3 variables
+
+```{r}
+# inner join User table and Session table
+user.session = merge(user, session, by = "udid", all = FALSE)
+user.session[,days_since_day1 := as.numeric( session_date - install_date)][, week_since_week1:= floor(days_since_day1/7) ]
+
+freq.plays.perday = user.session[,.N, by = days_since_day1][order(days_since_day1)]
+user.IAP.first3months = user.IAP[transaction_date <=  "2015-08-31" ,lapply(.SD, sum),by = days_since_day1, .SDcols =  c("daily_iap_rev","purchases_made")][order(days_since_day1)]
+
+freqPlays.vs.Rev = data.table(freq.plays.perday = freq.plays.perday$N, revenue=user.IAP.first3months$daily_iap_rev   )
+cor(freqPlays.vs.Rev)
+
+
+freqPlays.vs.freqPurchase = data.table(freq.plays.perday = freq.plays.perday$N, freqPurchase = user.IAP.first3months$purchases_made   )
+cor(freqPlays.vs.freqPurchase)
+```
+
+##7. Answer to questions
+####What is LTV (in $) of users in this game? What would you project LTV of these users to be if they continued to play the game beyond the observation period?
+#### Answer : 6 months LTV  (191 days) = $3.92, Predicted LTV (587 days until steady state) = $6.91   
+```{r}
+plot(y = aggregated.daily.revenue$cumsum_rev_peruser,
+     x = aggregated.daily.revenue$days_since_day1,
+     pch = 1, 
+     xlab = "days since registration day",
+     xlim = c(1,650),
+     ylim = c(0, 8),
+     ylab = "Cumulative sum revenue per user in $",
+     main = "CumSum Revenue per user by Days Since\n Registration Day (actual 6 months & prediction)")
+abline(max( aggregated.daily.revenue$cumsum_rev_peruser),0, lty = 5)
+
+lines(predict(lm_model, data.frame(days_since_day1 = c(1:650))), col = "blue")
+abline(max(predict(lm_model, data.frame(days_since_day1 = c(1:650)))),0, lty = 5)
+abline(v = which.max (predict(lm_model, data.frame(days_since_day1 = c(1:650)))), lty = 5)
+legend(-14, 8.2, legend=c("actual", "prediction"),
+       col=c("black", "blue"), lty=c(3,1), cex=0.6,
+       title="Legend", text.font=4)
+
+text(245, 3.5, "($3.92, 191)")
+text(520, 7.2, "($6.91, 587)")
+text(120, 4.2, "LTV 6 months (given)")
+text(250, 7.2, "LTV predicted")
+```
+
+#### What are the key assumptions that you are making? What are the weaknesses of these assumptions? 
+#### Answer : 
+#### 1. No interesting update in the game that can hype up the slowing down purchase activity (weakness : no upward trend along LTV, only decay)
+#### 2. The LTV curve represented by quadratic - logarithmic curve(weakness :  the LTV estimated to be decay in logarithmic manner)
+#### 3. LTV is univariate function, which means its only depends over time (weakness: it actually depends on much more variables such as: update features, in game events, holiday/non-holiday season, players in-game activity)
+
+<br><br>
+
+#### Why might it be important to have an estimate of a user's LTV?
+#### Answer : 
+#### Because it allows the manager to have clear and important metric about the game, and decide what direction next:
+#### 1. if the LTV is way too low : the manager can decide to just ditch the game and start creating a new and better game 
+#### 2. if the LTV is acceptable (not too low) : the manager can decide to put more effort improving the game 
+#### 3. if the LTV is good : the manager can decide to maintain the good performance, while systematially adding new features to improve the LTV 
+
+<br><br>
+
+#### How might the LTV of new users change as the game spends more time in the market? 
+#### Answer : 
+#### It depends, if there is no interesting update for the game, the LTV of new user would be most likely the same as the existing user or even lower. The reason is because word of mouth between friends. The existing users may start get bored and complaining regarding the lack of update in the game, and eventually they will tell their friends who are about to start playing the game(or just started). In contrast, if the game is periodically updated to fix existing bug and gameplay improvement, the LTV of new user will increase.
+
+<br><br> 
+
+#### What additional data might you want to in order improve your estimates? How would you use it? 
+#### Answer: 
+#### 1. I have started notice the begining of obvious decay at the begining of month 6th, I believe by having 3 more months of IAP table will improve my model significantly ( by using simpler model)
+#### 2. The duration of each session. As my previous inspection showed there are strong correlation between session activities vs Purchase activities, I strongly believe that there are strong correlation between duration of each session and Purchase activities, which eventually affects LTV. If I have this information, I would compare the plot of cumsum revenue (LTV) and cumsum session duration by each day. Then find the conversion rate between playing time and purchase activities, or even incorporate this feature in to my least square model.
+
+<br><br> 
+
+#### Would you want to estimate this model for different groups of users rather than using all user data together for your estimate? If so, which groups of users would you want to model separately? 
+#### Answer:
+#### Yes, I would probably calculate the LTV of paid-user ( since only 3.72 % of registered users actually spent their money). Also I would like to see the LTV group based on country and device type. Therefore whenever a new user installed the game (where we tracked his geographic location and device type), we will have some sort of estimate how much LTV this person is.  
+
+##8. Crossvalidation of the model (5-Fold)
+#### After the phone interview with Wenjun on Thursday, August 10th. I learned there might be a potential overfitting of the model. One way to check the over fitting is to perform 5 fold cross-validation. 
+  
+    However,since the proportion of paid user is relatively much lower than non-paid user(3 percent are paid users), we need to  perform stratified sampling for this Cross validation, because if we sampled randomly without considering paid/nonpaid users, there is high likely we may get all non-paid users in our fold and it will be a problem. In higher level, this is my approach to attemp the stratified sampling:   
+      I put users who paid into one bucket and non-paid to another bucket
+      I produced 5 fold from each bucket(then we have 10 folds from two buckets)
+      Then I combined the nth fold from bucket 1st and nth fold  from bucket 2nd into a single fold to be analyzed
+      by doing this, each fold of my 5-fold have equal proportion of paid users between each other
+
+And after performing the analysis, I saw a bit of RMSE improvement when I tried a simpler model by reducing the polynomial from 2nd degree into 1st degree
+<br>
+Before : we calculated the cumulative sum and my LTV model defined as:
+<center><h3>LTV(days) =  intercept + a(log(days)) + b(days)^2 + c(days)</h3></center>
+<br>
+Now :
+<center><h3>LTV(days) =  intercept + a(log(days)) + b(days)</h3></center>
+<br>
+By changing the 2nd degree polynomial into 1st degree, the RMSE average reduced from 0.5456885 into 0.5434066 
+Finally, here's the result of my 5-fold cross validation based on my simpler equation (1st degree polynomial):
+
+```{r}
+# performing stratified sampling 
+user.who.paid = unique(IAP$udid)
+# we dont need to sample user who do not paid, because the impact weight of each of them is the same (zero impact to revenue)
+user.who.not.paid = unique(user$udid)[!unique(user$udid) %in% unique(IAP$udid)] 
+
+set.seed(1)
+paid.fold = createFolds(seq(1, length(user.who.paid)), k = 5)
+
+RMSE = vector()
+for(i in seq(1:5) ){
+  user.IAP.fold.n.test = user.IAP[udid %in% user.who.paid[paid.fold[[i]]]]
+  user.IAP.fold.n.train = user.IAP[udid %in% user.who.paid[-paid.fold[[i]]]]
+  
+  # aggregating by day 
+  aggregated.daily.revenue.fold.n.test = user.IAP.fold.n.test[,lapply(.SD, sum),by = days_since_day1, .SDcols = "daily_iap_rev"][order(days_since_day1)] 
+  aggregated.daily.revenue.fold.n.train = user.IAP.fold.n.train[,lapply(.SD, sum),by = days_since_day1, .SDcols = "daily_iap_rev"][order(days_since_day1)] 
+  
+  # finding average revenue per user 
+  aggregated.daily.revenue.fold.n.test[,cumsum_rev_peruser := cumsum(daily_iap_rev)/(length(user.who.not.paid)*(1/5) + length(unique(user.IAP.fold.n.test$udid)))]
+  aggregated.daily.revenue.fold.n.train[,cumsum_rev_peruser := cumsum(daily_iap_rev)/(length(user.who.not.paid)*(4/5) + length(unique(user.IAP.fold.n.train$udid)))]
+  
+  plot(y = aggregated.daily.revenue.fold.n.train$cumsum_rev_peruser,
+       x = aggregated.daily.revenue.fold.n.train$days_since_day1,
+       type = "l", col = "green", lwd = 2,
+       xlab = "days since registration day",
+       xlim = c(1,300),
+       ylim = c(0, 6),
+       ylab = "Cumulative sum revenue per user",
+       main = paste("The", i ,"st/nd/rd/th fold Cumulative Revenue\n per user by 5 fold CrossValidation"))
+  abline(max( aggregated.daily.revenue.fold.n.train$cumsum_rev_peruser),0, col = "green", lwd = 2)
+  lines(y = aggregated.daily.revenue.fold.n.test$cumsum_rev_peruser,
+        x = aggregated.daily.revenue.fold.n.test$days_since_day1,
+        type = "l", col = "orange", lwd = 2)
+  abline(max( aggregated.daily.revenue.fold.n.test$cumsum_rev_peruser),0, col = "orange", lwd = 2)
+  lm_model = lm(cumsum_rev_peruser ~ log(days_since_day1) + poly(days_since_day1,1) , data = aggregated.daily.revenue.fold.n.train) 
+  lines(predict(lm_model, data.frame(days_since_day1 = c(1:191))), lty = 5,col = "blue", lwd = 2 )
+  abline(max(predict(lm_model, data.frame(days_since_day1 = c(1:191)))),0, lty = 5, lwd = 2, col = "blue")
+  abline(v = which.max (predict(lm_model, data.frame(days_since_day1 = c(1:191)))), lty = 5, lwd = 2, col = "blue")
+  legend(-7, 6.1, legend=c("nth fold train","nth fold test", "prediction"),
+         col=c("green","orange",  "blue"), lty=c(1,1,3), cex=0.6, lwd = c(2,2,2),
+         title="Legend", text.font=4)
+  RMSE[i] = sqrt(mean((predict(lm_model, data.frame(days_since_day1 = c(1:length(aggregated.daily.revenue.fold.n.test$cumsum_rev_peruser)))) - 
+                         (aggregated.daily.revenue.fold.n.test$cumsum_rev_peruser))^2))
+  text(230, y = 1.4, labels = paste("RMSE is\n", round(RMSE[i],3)), lwd = 2, cex = 1.5)
+  if(i == 1){ plot.1st.k = recordPlot()}
+  if(i == 2){ plot.2nd.k = recordPlot()}
+  if(i == 3){ plot.3rd.k = recordPlot()}
+  if(i == 4){ plot.4th.k = recordPlot()}
+  if(i == 5){ plot.5th.k = recordPlot()}
+}
+
+# RMSE of each fold:
+RMSE
+
+paste("After performing 5-fold cross validation, the average RMSE is ",round(mean(RMSE),4))
+```
+### Conclusion:
+#### After performing  the 5 fold cross validation, I have learned that my model is indeed somewhat overfits the training data, with the average RMSE of $0.5434.In addition, I would like to pointed out that  the number of paid users are relatively much smaller than non paid user.Also, even among the paid users, the distribution of spending is not evenly distributed, which means some users spent very small amount of money,while oter users spent extremely large amount of money. Thus, when I performed 5 fold sampling, some sample fold contains these big spender while other folds containst small spender( such as my 1st and 3rd fold according to the grapg), thus it will affect the LTV calculation of each fold. 
+
+<br>
+
+### Afterwards, this is a fun challenge and I would like to thank you for this opportunity. I have learned a lot in this short period of time about data analyst role in gaming industry 
+
+
+
